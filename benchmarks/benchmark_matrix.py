@@ -52,7 +52,6 @@ def main():
             py_med, py_min = benchmark(
                 lambda: matmul(A_list, B_list)
             )
-            speedup = py_min / numpy_min
             py_text = f"{py_min:.4f}"
             speedup_text = f"{py_min / numpy_min:.2f}x"
         else:

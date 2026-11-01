@@ -1,7 +1,7 @@
 [project]
 name = "numpy-inference-lab"
 version = "0.1.0"
-description = "Add your description here"
+description = "phase 1 of learning ai-inference engineering by doing it"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
