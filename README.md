@@ -8,12 +8,15 @@ of neural networks, written by hand, tested, and benchmarked.
 - `operations.py`: vector add, elementwise multiply, dot product, magnitude
 - `matrix.py`: matrix multiplication in pure Python (with input validation) and NumPy
 - `softmax.py`: naive and numerically stable softmax, batched over the last axis
+- `layout.py`: byte offset of any element from an array's strides
 - `benchmarks/harness.py`: shared timer, 3 warm-up runs, then 20 timed runs
 - `benchmarks/benchmark_matrix.py`: Python vs NumPy matmul, GFLOP/s
 - `benchmarks/benchmark_softmax.py`: naive vs stable softmax at GPT-2 vocab size, GB/s
 - `benchmarks/bandwidth_ceiling.py`: memory copy ceiling and exp throughput
+- `benchmarks/benchmark_layout.py`: row vs column reads, and a stride sweep
 - `tests/`: correctness tests, including overflow, underflow, batches,
-  rectangular shapes, empty input, and incompatible dimensions
+  rectangular shapes, empty input, incompatible dimensions, and memory
+  offsets checked against real addresses
 
 ## Run it
 
@@ -23,18 +26,19 @@ uv run python -m pytest -v
 uv run python benchmarks/benchmark_matrix.py
 uv run python benchmarks/benchmark_softmax.py
 uv run python benchmarks/bandwidth_ceiling.py
+uv run python benchmarks/benchmark_layout.py
 ```
 
 ## Environment
 
-|        |                                                                                 |
-| ------ | ------------------------------------------------------------------------------- |
-| CPU    | Intel Core i5-10310U @ 1.70 GHz, 4 cores / 8 threads (laptop), AVX2, no AVX-512 |
-| OS     | Windows                                                                         |
-| Python | 3.12                                                                            |
-| NumPy  | 2.5.4                                                                           |
-| BLAS   | scipy-openblas 0.3.34 (Haswell kernels)                                         |
-| Data   | float64 unless noted, random inputs, fixed seed                                 |
+|        |                                                                                          |
+| ------ | ---------------------------------------------------------------------------------------- |
+| CPU    | Intel Core i5-10310U @ 1.70 GHz, 4 cores / 8 threads (laptop), 6 MB L3, AVX2, no AVX-512 |
+| OS     | Windows                                                                                  |
+| Python | 3.12                                                                                     |
+| NumPy  | 2.5.4                                                                                    |
+| BLAS   | scipy-openblas 0.3.34 (Haswell kernels)                                                  |
+| Data   | float64 unless noted, random inputs, fixed seed                                          |
 
 All timings are the minimum of 20 timed runs after 3 warm-up runs.
 
@@ -123,3 +127,66 @@ output once (2 × batch × 50,257 × 8 bytes).
 
 **Next:** a fused version that makes fewer passes over memory, and float32
 throughout.
+
+---
+
+## 3. Memory layout
+
+NumPy stores a 2D array row by row (C order). Moving one step along an axis
+skips a fixed number of bytes, called the stride. For an `(n, n)` float64
+array the strides are `(n × 8, 8)`: n × 8 bytes to the next row, 8 bytes to
+the next column. The byte offset of any element is
+
+```
+offset(i, j) = i × strides[0] + j × strides[1]
+```
+
+`tests/test_layout.py` checks this formula against the real memory addresses
+NumPy reports, for both normal and transposed arrays.
+
+### Same data, different reading order
+
+`a.copy()` reads row by row. `a.T.copy()` reads down the columns of `a`. Both
+read and write exactly the same bytes (2 × n² × 8).
+
+| n    | copy (ms) | T.copy (ms) | copy GB/s | T.copy GB/s | T.copy slower by |
+| ---- | --------- | ----------- | --------- | ----------- | ---------------- |
+| 1024 | 2.502     | 10.86       | 6.71      | 1.55        | 4.3×             |
+| 4096 | 38.31     | 311.0       | 7.01      | 0.86        | 8.1×             |
+
+### Stride sweep
+
+Sum the same number of values (2¹⁹) every time, spaced `stride` values apart.
+Any difference in time comes only from where the values sit in memory.
+
+| Stride       | 1    | 2    | 4    | 8    | 16   | 32   | 64   |
+| ------------ | ---- | ---- | ---- | ---- | ---- | ---- | ---- |
+| ms           | 0.17 | 0.51 | 1.11 | 2.54 | 4.08 | 4.88 | 4.91 |
+| ns per value | 0.32 | 0.98 | 2.11 | 4.85 | 7.78 | 9.30 | 9.37 |
+
+**Findings**
+
+1. **Transposing is free; reading the transpose is not.** `a.T` copies no
+   data. It shares memory with `a` and only swaps the strides to `(8, n × 8)`.
+   The cost appears when the data is read in that order.
+2. **Reading down columns is 4.3× slower at n = 1024 and 8.1× slower at
+   n = 4096**, for exactly the same bytes. At n = 4096 the column read reaches
+   only 0.86 GB/s. The gap grows with size, which is consistent with the
+   cache: an 8 MB matrix is close to the 6 MB L3 cache, so some lines are
+   still cached when the column walk returns for their neighbours. A 134 MB
+   matrix is not, so almost every value costs a separate trip to RAM.
+3. **Cost per value roughly doubles with each doubling of the stride up to
+   16, then levels off** (9.30 ns at stride 32, 9.37 ns at stride 64). Memory
+   is delivered in cache lines, not single numbers: once values are far enough
+   apart that each one needs its own line, spreading them further costs
+   nothing extra. The same shape appeared in three separate runs.
+4. **The curve levels off at stride 16 (128 bytes), not 8 (64 bytes, one cache
+   line).** This is consistent with Intel's prefetcher fetching cache lines in
+   adjacent pairs, which makes the effective unit about 128 bytes on this CPU.
+5. **The first step (stride 1 → 2) is 3.1×, more than the 2× the cache-line
+   model predicts.** A contiguous array lets NumPy sum with SIMD instructions
+   and a strided view does not, so this step mixes two effects.
+6. **A normal `copy()` reaches about 7 GB/s, roughly half of the 16.1 GB/s
+   `copyto` ceiling.** `copy()` allocates a new array on every call while
+   `copyto` writes into an existing one, which likely accounts for the
+   difference. Not yet measured separately.
