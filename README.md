@@ -9,14 +9,17 @@ of neural networks, written by hand, tested, and benchmarked.
 - `matrix.py`: matrix multiplication in pure Python (with input validation) and NumPy
 - `softmax.py`: naive and numerically stable softmax, batched over the last axis
 - `layout.py`: byte offset of any element from an array's strides
+- `block.py`: LayerNorm, GELU, feed-forward network, and a residual block
 - `benchmarks/harness.py`: shared timer, 3 warm-up runs, then 20 timed runs
 - `benchmarks/benchmark_matrix.py`: Python vs NumPy matmul, GFLOP/s
 - `benchmarks/benchmark_softmax.py`: naive vs stable softmax at GPT-2 vocab size, GB/s
 - `benchmarks/bandwidth_ceiling.py`: memory copy ceiling and exp throughput
 - `benchmarks/benchmark_layout.py`: row vs column reads, and a stride sweep
+- `benchmarks/benchmark_block.py`: time per stage of a GPT-2-sized block
 - `tests/`: correctness tests, including overflow, underflow, batches,
   rectangular shapes, empty input, incompatible dimensions, and memory
-  offsets checked against real addresses
+  offsets checked against real addresses, LayerNorm and GELU properties,
+  and the residual connection
 
 ## Run it
 
@@ -27,6 +30,7 @@ uv run python benchmarks/benchmark_matrix.py
 uv run python benchmarks/benchmark_softmax.py
 uv run python benchmarks/bandwidth_ceiling.py
 uv run python benchmarks/benchmark_layout.py
+uv run python benchmarks/benchmark_block.py
 ```
 
 ## Environment
@@ -190,3 +194,52 @@ Any difference in time comes only from where the values sit in memory.
    `copyto` ceiling.** `copy()` allocates a new array on every call while
    `copyto` writes into an existing one, which likely accounts for the
    difference. Not yet measured separately.
+
+---
+
+## 4. Transformer block (feed-forward half)
+
+The second half of one transformer layer, at GPT-2 small's sizes:
+
+```
+out = x + W2 · GELU(W1 · LayerNorm(x) + b1) + b2
+       (T, 768) → (T, 3072) → (T, 768)
+```
+
+T is the number of tokens processed at once: 1 during text generation
+(decode), hundreds while reading a prompt (prefill) or when many requests are
+batched together. Weights use GPT-2's starting scale (normal, std 0.02).
+Each stage is timed separately, with its input prepared outside the timer.
+
+| Tokens (T) | LN (ms) | matmul 1 (ms) | GELU (ms) | matmul 2 (ms) | Total (ms) | Matmul share | Matmul GFLOP/s |
+| ---------- | ------- | ------------- | --------- | ------------- | ---------- | ------------ | -------------- |
+| 1          | 0.046   | 1.216         | 0.281     | 1.531         | 3.074      | 89%          | 3.4            |
+| 8          | 0.197   | 1.660         | 1.542     | 1.557         | 4.955      | 65%          | 23.5           |
+| 64         | 0.807   | 6.388         | 12.745    | 3.966         | 23.906     | 43%          | 58.3           |
+| 512        | 9.640   | 34.054        | 106.480   | 19.827        | 170.001    | 32%          | 89.7           |
+
+GFLOP/s = 2 × T × 768 × 3072 × 2 (two matmuls) ÷ time in the two matmuls.
+
+**Findings**
+
+1. **With one token, the matmuls are limited by memory.** The two weight
+   matrices hold 37.7 MB (768 × 3072 × 8 bytes each). Every weight is loaded
+   once and used once, so the 2.75 ms spent in the matmuls means weights arrive
+   at 13.7 GB/s, 85% of the 16.1 GB/s copy ceiling, while compute reaches only
+   3.4 GFLOP/s. This is the decode regime of LLM inference.
+2. **With 512 tokens, the matmuls are limited by compute.** Each weight is
+   reused for every token, and throughput reaches 89.7 GFLOP/s, close to the
+   ~100 GFLOP/s peak measured in section 1. Processing many tokens or many
+   requests together is what turns a memory-bound matmul into a compute-bound
+   one. This is why LLM servers batch requests.
+3. **GELU grows from 9% to 63% of the block's time** and takes longer than both
+   matmuls combined at T = 512. It applies `tanh` to every one of T × 3072
+   values, the same kind of expensive float64 math function as `exp` in
+   section 2. Once the matmuls run efficiently, the elementwise step becomes
+   the bottleneck.
+4. **LayerNorm stays small** (2–6% of the time) because it works on T × 768
+   values, a quarter of GELU's T × 3072.
+5. **At T = 512, matmul 1 takes 1.7× longer than matmul 2** (34.1 vs 19.8 ms)
+   for the same number of operations. Its output is 4× larger (T × 3072 vs
+   T × 768), and adding the bias is a separate pass over that output. Not yet
+   measured separately.
