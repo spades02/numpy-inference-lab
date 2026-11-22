@@ -10,12 +10,14 @@ of neural networks, written by hand, tested, and benchmarked.
 - `softmax.py`: naive and numerically stable softmax, batched over the last axis
 - `layout.py`: byte offset of any element from an array's strides
 - `block.py`: LayerNorm, GELU, feed-forward network, and a residual block
+- `fused.py`: softmax with no temporary arrays, and a cache-blocked version
 - `benchmarks/harness.py`: shared timer, 3 warm-up runs, then 20 timed runs
 - `benchmarks/benchmark_matrix.py`: Python vs NumPy matmul, GFLOP/s
 - `benchmarks/benchmark_softmax.py`: naive vs stable softmax at GPT-2 vocab size, GB/s
 - `benchmarks/bandwidth_ceiling.py`: memory copy ceiling and exp throughput
 - `benchmarks/benchmark_layout.py`: row vs column reads, and a stride sweep
 - `benchmarks/benchmark_block.py`: time per stage of a GPT-2-sized block
+- `benchmarks/benchmark_fused.py`: four softmax versions, one change at a time
 - `tests/`: correctness tests, including overflow, underflow, batches,
   rectangular shapes, empty input, incompatible dimensions, and memory
   offsets checked against real addresses, LayerNorm and GELU properties,
@@ -31,6 +33,7 @@ uv run python benchmarks/benchmark_softmax.py
 uv run python benchmarks/bandwidth_ceiling.py
 uv run python benchmarks/benchmark_layout.py
 uv run python benchmarks/benchmark_block.py
+uv run python benchmarks/benchmark_fused.py
 ```
 
 ## Environment
@@ -243,3 +246,44 @@ GFLOP/s = 2 × T × 768 × 3072 × 2 (two matmuls) ÷ time in the two matmuls.
    for the same number of operations. Its output is 4× larger (T × 3072 vs
    T × 768), and adding the bias is a separate pass over that output. Not yet
    measured separately.
+
+---
+
+## 5. Making softmax faster
+
+Starting from the stable softmax in section 2, change one thing at a time on a
+`(64, 50257)` input and measure each step. Every version passes the same
+correctness tests against the original (`rtol = 1e-5` for float32).
+
+| Version | Change                                             | Bottleneck it attacks                  | ms    | GB/s | Speedup |
+| ------- | -------------------------------------------------- | -------------------------------------- | ----- | ---- | ------- |
+| v0      | stable softmax, float64 (section 2)                | —                                      | 42.21 | 1.22 | 1.00×   |
+| v1      | write every step into one existing buffer (`out=`) | allocating 3 temporary 25 MB arrays    | 29.63 | 1.74 | 1.42×   |
+| v2      | v1 in float32                                      | slow float64 `exp`, and half the bytes | 10.23 | 2.52 | 4.13×   |
+| v3      | v2, 8 rows at a time (1.6 MB blocks)               | trips to RAM between the 5 passes      | 7.92  | 3.25 | 5.33×   |
+
+GB/s counts the minimum traffic (one read and one write of the array) in each
+version's own data type.
+
+**Findings**
+
+1. **The biggest win came from fixing the measured bottleneck.** Section 2
+   showed `exp` was the bottleneck and float32 `exp` is 4.5× faster on this
+   CPU. Switching to float32 gave 2.9× on top of v1, more than any other change.
+2. **Removing temporary arrays gave 1.42×.** It couldn't reach 2×, because the
+   `exp` work itself didn't change.
+3. **Working in cache-sized blocks gave another 1.29×.** Each 8-row block
+   (1.6 MB) fits in the 6 MB L3 cache, so passes 2–5 read from cache instead of
+   RAM. This is the idea behind a fused GPU kernel: load data into fast memory
+   once, do every step there, and write the result once. NumPy can't fuse
+   operations, but blocking gets part of the benefit.
+4. **The fastest version still uses only 20% of memory bandwidth** (3.25 of
+   16.1 GB/s). At roughly 1.4 ns per value, float32 `exp` alone accounts for
+   about half of v3's time. The remaining limit is computation on a single
+   core, not memory.
+5. **The same code gives different results on different hardware.** On a Linux
+   test machine with AVX-512, float32 gave only 1.9× and blocking gave nothing.
+   An optimization has to be measured on the hardware it is meant for.
+6. **Tests prove correctness; benchmarks prove efficiency.** A first version of
+   v3 ran the whole softmax once per block. It produced correct output and
+   passed every test, but was 8× slower. Only the benchmark caught it.
