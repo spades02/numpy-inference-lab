@@ -1,7 +1,23 @@
 # numpy-inference-lab
 
+[![tests](https://github.com/spades02/numpy-inference-lab/actions/workflows/tests.yml/badge.svg)](https://github.com/spades02/numpy-inference-lab/actions/workflows/tests.yml)
+
 Phase 1 of my path to AI inference engineering: the numerical building blocks
 of neural networks, written by hand, tested, and benchmarked.
+
+## Highlights
+
+- **Softmax 5.3× faster without changing the math** (42.2 → 7.9 ms): no
+  temporary arrays, float32, and cache-sized blocks. [Section 5](#5-making-softmax-faster)
+- **A GPT-2-sized layer is memory-bound at 1 token and compute-bound at 512.**
+  At T = 1 the matmuls read weights at 85% of memory bandwidth but reach only
+  3.4 GFLOP/s; at T = 512 they reach 89.7 GFLOP/s. [Section 4](#4-transformer-block-feed-forward-half)
+- **Reading the same bytes in a different order is 8.1× slower.** Memory
+  arrives in cache lines, not single numbers. [Section 3](#3-memory-layout)
+- **NumPy's float64 `exp`, not memory, is the softmax bottleneck on this CPU**,
+  and float32 `exp` is 4.5× faster. [Section 2](#2-softmax)
+
+![Softmax versions](docs/charts/softmax_versions.png)
 
 ## What's here
 
@@ -18,6 +34,7 @@ of neural networks, written by hand, tested, and benchmarked.
 - `benchmarks/benchmark_layout.py`: row vs column reads, and a stride sweep
 - `benchmarks/benchmark_block.py`: time per stage of a GPT-2-sized block
 - `benchmarks/benchmark_fused.py`: four softmax versions, one change at a time
+- `benchmarks/make_charts.py`: draws the charts in `docs/charts/` from the results below
 - `tests/`: correctness tests, including overflow, underflow, batches,
   rectangular shapes, empty input, incompatible dimensions, and memory
   offsets checked against real addresses, LayerNorm and GELU properties,
@@ -34,6 +51,7 @@ uv run python benchmarks/bandwidth_ceiling.py
 uv run python benchmarks/benchmark_layout.py
 uv run python benchmarks/benchmark_block.py
 uv run python benchmarks/benchmark_fused.py
+uv run python benchmarks/make_charts.py
 ```
 
 ## Environment
@@ -67,6 +85,8 @@ Python is skipped above n = 128, where a single call would take seconds to minut
 
 GFLOP/s = 2n³ floating-point operations ÷ time. The 1-thread column was
 measured with `OPENBLAS_NUM_THREADS=1`.
+
+![Matmul throughput](docs/charts/matmul_gflops.png)
 
 **Findings**
 
@@ -171,6 +191,8 @@ Any difference in time comes only from where the values sit in memory.
 | ms           | 0.17 | 0.51 | 1.11 | 2.54 | 4.08 | 4.88 | 4.91 |
 | ns per value | 0.32 | 0.98 | 2.11 | 4.85 | 7.78 | 9.30 | 9.37 |
 
+![Stride sweep](docs/charts/stride_sweep.png)
+
 **Findings**
 
 1. **Transposing is free; reading the transpose is not.** `a.T` copies no
@@ -222,6 +244,8 @@ Each stage is timed separately, with its input prepared outside the timer.
 | 512        | 9.640   | 34.054        | 106.480   | 19.827        | 170.001    | 32%          | 89.7           |
 
 GFLOP/s = 2 × T × 768 × 3072 × 2 (two matmuls) ÷ time in the two matmuls.
+
+![Block regimes](docs/charts/block_regimes.png)
 
 **Findings**
 
